@@ -20,9 +20,11 @@ BakaSU 有三种钩子模式：
 
 ## 集成做了什么
 
-`scripts/integrate.py` 幂等完成四件事：
+`scripts/integrate.py` 幂等完成五件事：
 
-1. **拷贝源码**：`BakaSU/kernel/` → `<内核>/drivers/kernelsu/`（107 个文件）
+1. **挂载源码**：`drivers/kernelsu` → 指向 `BakaSU/kernel/` 的**符号链接**
+   （`Kbuild:71` 硬检查 `$(KSU_SRC)/../.git` 必须存在，拷贝代码会 `$(error)`；
+   且 `git rev-list --count HEAD` 要完整历史，clone 不能 `--depth 1`）
 2. **挂载**：`drivers/Kconfig` 加 `source "drivers/kernelsu/Kconfig"`，
    `drivers/Makefile` 加 `obj-$(CONFIG_KSU) += kernelsu/`
 3. **手动钩子**（按 [官方文档](https://bakasu.org/zh-Hans/guide/manual-integrate) 的 5.4 分支）：
@@ -92,6 +94,103 @@ adb shell "su -c id"                    # uid=0(root)
 adb shell "cat /proc/kallsyms | grep -c ksu_"   # > 0
 adb shell "lsmod | wc -l"               # 190 左右，原厂模块全在
 ```
+
+## 管理器签名：信任 sukisu-oscarc-lto24 的自签 APK
+
+本仓库**不构建 manager APK**，统一用
+[baipinaaa/sukisu-oscarc-lto24](https://github.com/baipinaaa/sukisu-oscarc-lto24)
+的 `.github/workflows/build-bakasu-manager.yml` 产物（包名 `com.resukisu.resukisu`）。
+那个 APK 用自签 keystore，内核默认只认官方签名，所以要**把对方证书指纹烧进内核**。
+
+### 原理
+
+`bakasu/kernel/manager/apk_sign.c` 从 APK 的 v2 签名块取**第一张证书的 DER**，
+比对「DER 字节数 + DER 的 sha256」。与 APK 内容、包名、apksigner 参数组合都无关。
+
+### 两处常量
+
+workflow `env:` 里各一份，注入步骤在「检出 BakaSU」之后：
+
+```
+MANAGER_SIGN_SIZE = 0x55d       (证书 DER 字节数 = 1373)
+MANAGER_SIGN_HASH = 48480a1f…c909a7d   (证书 DER 的 sha256)
+```
+
+这是**纯公开的证书指纹，不含私钥**。私钥只在对方仓库的 GitHub Secrets 里
+（`MANAGER_KEYSTORE_BASE64` / `MANAGER_KEYSTORE_PASSWORD`），本仓库不持有、也不该持有 —— 
+一旦私钥公开，任何 APK 都能被这个内核认成 manager（manager 权限包括改 allowlist 授权 root）。
+
+`sed` 改的是 `bakasu/kernel/manager/manager_sign.h`：
+
+```c
+#define EXPECTED_SIZE_BAKASU 0x55d
+#define EXPECTED_HASH_BAKASU "48480a1f…"
+```
+
+`apk_sign_keys[]` 里 `{ EXPECTED_SIZE_BAKASU, EXPECTED_HASH_BAKASU }`
+**无条件编入且排第一**（不在 `#ifdef CONFIG_KSU_MULTI_MANAGER_SUPPORT` 里）。
+
+### 13.1 坑一：`CERT_MAX_LENGTH` 1024 硬上限
+
+`bakasu/kernel/manager/apk_sign.c:137` 有一条上游硬编码：
+
+```c
+#define CERT_MAX_LENGTH 1024
+    if (certificate_size > CERT_MAX_LENGTH) {
+        pr_info("cert length overlimit\n");
+        return false;
+    }
+```
+
+这个检查在算 sha256 **之前**就 return。对方密钥是 **RSA 4096，证书 DER = 1373 字节**，
+超出 349 字节 —— 指纹注得再对也走不到比对。
+
+**判别法**：`dmesg` 里正常的 app 会先打 `KernelSU: sha256: <64hex>`；
+被上限拒掉的**没有** `sha256` 行，只有 `KernelSU: cert length overlimit`。
+
+修复（同一条注入步骤里）：
+
+```bash
+sed -i "s|^#define CERT_MAX_LENGTH .*|#define CERT_MAX_LENGTH 2048|" bakasu/kernel/manager/apk_sign.c
+```
+
+`char cert[CERT_MAX_LENGTH]` 放在 kworker 的 16 KB 内核栈上，2048 安全；
+主流证书（RSA 2048/3072、ECDSA P-256/P-384）本来就 ≤ 1024，不受影响。
+
+工作流里有一条联动断言：
+
+```bash
+CAP=$(grep -m1 '^#define CERT_MAX_LENGTH ' "$F" | awk '{print $3}')
+[ $((CAP)) -ge $((MANAGER_SIGN_SIZE)) ] || exit 1
+```
+
+**以后换密钥必做**：先 `keytool -exportcert -alias <alias> -keystore <jks> -file c.der`
+然后 `stat -c%s c.der && sha256sum c.der`，把两个值填进 `env:`；
+若 DER > 1024，同时确认 `CERT_MAX_LENGTH` 够大。
+
+### 13.2 坑二：BakaSU ref 必须与 manager 的 UAPI 对齐
+
+manager 在 BakaSU main `548d1dda060ca198823d8808804d01f5209ef4a9`（UAPI v6）上构建，
+本仓库 `bakasu_ref` 默认值也是它。若内核停在 `v4.2.0-rc3`（UAPI v4），
+会出现 manager 功能置灰、`libksud.so` 的 supercall 号段对不上。
+
+### 13.3 坑三：换签名不能覆盖安装
+
+从官方 APK 切过来要 `adb uninstall com.resukisu.resukisu`；
+`/data/adb/ksu/` 下的配置和模块不受影响。
+
+若内核换了指纹，必须**重刷内核**（`EXPECTED_HASH_BAKASU` 是编译期常量），没有运行时办法。
+
+### 验证
+
+```bash
+adb shell su -c 'dmesg | grep -i "is_manager"'          # 必须是 is_manager: 1
+adb shell su -c '/data/adb/ksud debug get-sign $(pm path com.resukisu.resukisu | sed "s/package://")'
+# 期望: size: 0x55d, hash: 48480a1f…
+```
+
+若 `debug get-sign` 输出 `size: 0x377, hash: d3469712…`，说明设备上装的还是
+**官方** manager APK，不是对方仓库的产物。
 
 ## 已知限制
 

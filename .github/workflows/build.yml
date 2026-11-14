@@ -131,6 +131,28 @@ jobs:
             || { echo "::error::BAKASU 不是 apk_sign_keys[] 的第一项"; exit 1; }
           echo "OK: 内核将信任 size=$MANAGER_SIGN_SIZE hash=$MANAGER_SIGN_HASH"
 
+      - name: 放宽证书长度上限 CERT_MAX_LENGTH (RSA 4096 证书 1373B 超上游 1024)
+        run: |
+          set -euo pipefail
+          # apk_sign.c:137 的上游硬编码上限 1024 在计算 sha256 之前就 return
+          # （日志：KernelSU: cert length overlimit -> is_manager: 0）。
+          # 对方 keystore 是 RSA 4096，证书 DER = 0x55d = 1373 字节，超出 349 字节。
+          # char cert[CERT_MAX_LENGTH] 放在 kworker 的 16 KB 内核栈上，2048 安全；
+          # 主流证书（RSA 2048/3072、ECDSA P-256/P-384）本来就 <= 1024，不受影响。
+          F=bakasu/kernel/manager/apk_sign.c
+          test -f "$F" || { echo "::error::$F 不存在"; exit 1; }
+          sed -i "s|^#define CERT_MAX_LENGTH .*|#define CERT_MAX_LENGTH 2048|" "$F"
+          echo "--- 注入结果 ---"
+          grep -n 'CERT_MAX_LENGTH' "$F"
+          grep -q '^#define CERT_MAX_LENGTH 2048$' "$F" \
+            || { echo "::error::CERT_MAX_LENGTH 放宽失败"; exit 1; }
+          # 上限必须真的 >= 证书 DER 字节数，否则注入指纹也白搭
+          CAP=$(grep -m1 '^#define CERT_MAX_LENGTH ' "$F" | awk '{print $3}')
+          test -n "$CAP" || { echo "::error::读不到 CERT_MAX_LENGTH"; exit 1; }
+          [ $((CAP)) -ge $((MANAGER_SIGN_SIZE)) ] \
+            || { echo "::error::CERT_MAX_LENGTH=$CAP 小于证书 $MANAGER_SIGN_SIZE 字节"; exit 1; }
+          echo "OK: CERT_MAX_LENGTH=$CAP >= 证书 $MANAGER_SIGN_SIZE 字节"
+
       - name: 集成 BakaSU（拷贝源码 + 手动钩子）
         run: |
           set -euo pipefail
