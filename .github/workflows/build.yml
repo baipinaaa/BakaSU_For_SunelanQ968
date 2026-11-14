@@ -21,6 +21,14 @@ permissions:
 env:
   KERNEL_REPO: https://github.com/baipinaaa/android_kernel_ums9157
   BAKASU_REPO: https://github.com/Baka-SU/BakaSU
+  # 统一使用 baipinaaa/sukisu-oscarc-lto24 自签 manager 的证书指纹。
+  # 内核比对的是「v2 签名块里第一张证书的 DER 字节数 + DER 的 sha256」：
+  #   kernel/manager/apk_sign.c  ->  { EXPECTED_SIZE_BAKASU, EXPECTED_HASH_BAKASU }
+  # 这是纯公开的证书指纹，不含私钥；私钥只在对方仓库的 Secrets 里。
+  # 取法（对方仓库）：keytool -exportcert -alias bakasu -keystore <jks> -file c.der
+  #                   stat -c%s c.der && sha256sum c.der
+  MANAGER_SIGN_SIZE: '0x55d'
+  MANAGER_SIGN_HASH: '48480a1fc5145334059cfc0f6c767dd5b6fdf05d4ffe2a5af03e80478c909a7d'
 
 jobs:
   build:
@@ -100,6 +108,28 @@ jobs:
           git -C bakasu checkout "$REF"
           git -C bakasu log --oneline -1
           git -C bakasu rev-list --count HEAD
+
+      - name: 注入自签 manager 签名指纹 (sukisu-oscarc-lto24)
+        run: |
+          set -euo pipefail
+          F=bakasu/kernel/manager/manager_sign.h
+          test -f "$F" || { echo "::error::$F 不存在，检查 BakaSU 目录结构"; exit 1; }
+          sed -i "s|^#define EXPECTED_SIZE_BAKASU .*|#define EXPECTED_SIZE_BAKASU $MANAGER_SIGN_SIZE|" "$F"
+          sed -i "s|^#define EXPECTED_HASH_BAKASU .*|#define EXPECTED_HASH_BAKASU \"$MANAGER_SIGN_HASH\"|" "$F"
+          echo "--- 注入结果 ---"
+          grep -n 'EXPECTED_SIZE_BAKASU\|EXPECTED_HASH_BAKASU' "$F"
+          # 双重断言：sed 匹配不到会静默跳过，编出来的内核照样不认 manager
+          grep -q "EXPECTED_HASH_BAKASU \"$MANAGER_SIGN_HASH\"" "$F" \
+            || { echo "::error::EXPECTED_HASH_BAKASU 注入失败 (宏名对不上?)"; exit 1; }
+          grep -q "EXPECTED_SIZE_BAKASU $MANAGER_SIGN_SIZE" "$F" \
+            || { echo "::error::EXPECTED_SIZE_BAKASU 注入失败"; exit 1; }
+          # BAKASU 槽位必须无条件编入（不在 CONFIG_KSU_MULTI_MANAGER_SUPPORT 里）且排第一
+          grep -q '{ EXPECTED_SIZE_BAKASU, EXPECTED_HASH_BAKASU }' bakasu/kernel/manager/apk_sign.c \
+            || { echo "::error::apk_sign_keys[] 里没有 BAKASU 槽位"; exit 1; }
+          awk '/apk_sign_keys\[\] = \{/{f=1;next} f&&/^};/{exit} f&&/EXPECTED_/{print;exit}' \
+            bakasu/kernel/manager/apk_sign.c | grep -q BAKASU \
+            || { echo "::error::BAKASU 不是 apk_sign_keys[] 的第一项"; exit 1; }
+          echo "OK: 内核将信任 size=$MANAGER_SIGN_SIZE hash=$MANAGER_SIGN_HASH"
 
       - name: 集成 BakaSU（拷贝源码 + 手动钩子）
         run: |
