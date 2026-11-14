@@ -94,14 +94,21 @@ jobs:
         run: |
           set -euo pipefail
           REF="${{ github.event.inputs.bakasu_ref || '548d1dda060ca198823d8808804d01f5209ef4a9' }}"
-          git clone --filter=blob:none "$BAKASU_REPO" bakasu
+          # 必须全量 clone：Kbuild 用 `git rev-list --count HEAD` 算版本号，
+          # 并用 `$(KSU_SRC)/../.git` 判断是否以 submodule 形式接入。
+          git clone "$BAKASU_REPO" bakasu
           git -C bakasu checkout "$REF"
           git -C bakasu log --oneline -1
+          git -C bakasu rev-list --count HEAD
 
       - name: 集成 BakaSU（拷贝源码 + 手动钩子）
         run: |
           set -euo pipefail
           python3 scripts/integrate.py kernel bakasu/kernel sprd_ums9157_defconfig 2>&1 | tee integrate.log
+          echo "=== 校验 symlink（Kbuild 要求 ../.git 存在） ==="
+          test -L kernel/drivers/kernelsu || { echo "::error::drivers/kernelsu 不是符号链接，Kbuild 会报 'use BakaSU as a git submodule'"; exit 1; }
+          ls -la kernel/drivers/kernelsu
+          test -e kernel/drivers/kernelsu/../.git || { echo "::error::drivers/kernelsu/../.git 不存在"; exit 1; }
           echo "=== 校验钩子 ==="
           for pat in 'ksu_handle_stat' 'ksu_handle_execveat' 'ksu_handle_faccessat' \
                      'ksu_handle_sys_reboot' 'ksu_handle_input_handle_event'; do

@@ -52,24 +52,35 @@ def sub_once(text, old, new, tag):
     return text.replace(old, new, 1)
 
 
-def copy_source(tree, src):
+def link_source(tree, src):
+    """把 <tree>/drivers/kernelsu 做成指向 BakaSU 源码 kernel/ 的符号链接。
+
+    Kbuild 第 59 行:
+        KSU_SRC := $(realpath $(dir $(abspath $(lastword $(MAKEFILE_LIST)))))
+        LOCAL_GIT_EXISTS := $(shell test -e $(KSU_SRC)/../.git && echo 1 || echo 0)
+        $(error You should use BakaSU as a git submodule instead of copying code directly)
+    即 realpath 解析后 $(KSU_SRC)/../.git 必须存在（= BakaSU 仓库根）。
+    拷贝代码会让 ../.git 指向内核树的 drivers/ 下，必然失败。
+    另外 Kbuild 还要 `git rev-list --count HEAD` 算版本号，所以 BakaSU 必须是
+    带完整历史的 clone（不能 --depth 1）。
+    """
     dst = os.path.join(tree, 'drivers', 'kernelsu')
-    if os.path.isdir(dst):
+    if os.path.islink(dst):
+        os.unlink(dst)
+    elif os.path.isdir(dst):
         shutil.rmtree(dst)
-    shutil.copytree(src, dst, ignore=shutil.ignore_patterns(
-        '.vscode', '*.o', '*.ko', '*.cmd', '.tmp_*', 'build-*'))
-    # 只用 Kbuild 参与 kbuild，剔掉宿主工具
-    for junk in ('Makefile', 'setup.sh', 'build-all.sh', 'build-all-x64.sh',
-                 'tools', 'preinit'):
-        p = os.path.join(dst, junk)
-        if os.path.isdir(p):
-            shutil.rmtree(p)
-            print('  [rm]   drivers/kernelsu/%s/' % junk)
-        elif os.path.exists(p):
-            os.remove(p)
-            print('  [rm]   drivers/kernelsu/%s' % junk)
-    n = sum(len(fs) for _, _, fs in os.walk(dst))
-    print('  [ok]   drivers/kernelsu copied (%d files)' % n)
+    elif os.path.exists(dst):
+        os.remove(dst)
+    rel = os.path.relpath(src, os.path.join(tree, 'drivers'))
+    try:
+        os.symlink(rel, dst)
+        print('  [ok]   drivers/kernelsu -> %s (symlink)' % rel)
+    except (OSError, NotImplementedError) as e:
+        # Windows 无管理员权限时无法建符号链接，退回拷贝（内核无法通过 Kbuild 检查，
+        # 仅用于本地语法自检）
+        print('  [WARN] symlink failed (%s), falling back to copy' % e)
+        shutil.copytree(src, dst)
+        print('  [ok]   drivers/kernelsu (copied %d files)' % sum(len(f) for _, _, f in os.walk(dst)))
 
 
 def patch_kconfig(tree):
@@ -440,8 +451,8 @@ def main():
     if not os.path.isdir(os.path.join(src, 'hook')):
         raise SystemExit('not a BakaSU kernel dir: %s' % src)
 
-    print('[1/5] copy source')
-    copy_source(tree, src)
+    print('[1/5] link source')
+    link_source(tree, src)
     print('[2/5] mount in drivers/')
     patch_kconfig(tree)
     patch_makefile(tree)
