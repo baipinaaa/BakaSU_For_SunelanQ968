@@ -1,0 +1,8 @@
+*.o
+*.ko
+*.cmd
+kernel/
+bakasu/
+boot.img
+modules.tgz
+integrate.log

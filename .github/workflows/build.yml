@@ -1,0 +1,244 @@
+name: bakasu-kernel-build
+
+# 给 Unisoc UMS9157 / Sunelan Q968 的内核（5.4.210 GKI 骨架 + 设备实现）
+# 集成 BakaSU（KernelSU downstream）手动钩子模式，产出可直接 fastboot 刷入的 boot.img。
+
+on:
+  workflow_dispatch:
+    inputs:
+      bakasu_ref:
+        description: 'BakaSU 分支或提交'
+        required: false
+        default: '548d1dda060ca198823d8808804d01f5209ef4a9'
+      kernel_ref:
+        description: '内核仓库分支或提交'
+        required: false
+        default: 'master'
+  push:
+    branches: [main]
+    paths-ignore:
+      - 'README.md'
+      - 'docs/**'
+
+permissions:
+  contents: write
+
+env:
+  KERNEL_REPO: https://github.com/baipinaaa/android_kernel_ums9157
+  BAKASU_REPO: https://github.com/Baka-SU/BakaSU
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: 环境信息
+        run: |
+          nproc; free -g | head -2; df -h / | tail -1
+
+      - name: 安装依赖
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq bc bison flex libssl-dev libelf-dev cpio \
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
+            gcc-arm-linux-gnueabi binutils-arm-linux-gnueabi python3
+
+      - name: 缓存 Android clang 12.0.5 (r416183b)
+        id: clang-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/clang-r416183b
+          key: android-clang-r416183b-v1
+
+      - name: 下载 Android clang 12.0.5 (r416183b)
+        if: steps.clang-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android12-release/clang-r416183b.tar.gz"
+          mkdir -p "$HOME/clang-r416183b"
+          curl -fL --retry 3 --retry-delay 5 --connect-timeout 30 -o /tmp/clang.tgz "$URL"
+          ls -l /tmp/clang.tgz
+          tar -xzf /tmp/clang.tgz -C "$HOME/clang-r416183b"
+
+      - name: 启用 clang 12.0.5
+        run: |
+          set -euo pipefail
+          echo "$HOME/clang-r416183b/bin" >> "$GITHUB_PATH"
+          echo "LD_LIBRARY_PATH=$HOME/clang-r416183b/lib64:$HOME/clang-r416183b/lib" >> "$GITHUB_ENV"
+          export PATH="$HOME/clang-r416183b/bin:$PATH"
+          echo "--- clang:"; clang --version | head -1
+          clang --version | head -1 | grep -q 'clang version 12\.0\.5' || { echo 'ERROR: clang 版本不对（缓存损坏？）'; exit 1; }
+
+      - name: 加 swap
+        continue-on-error: true
+        run: |
+          sudo rm -f /swapfile
+          sudo dd if=/dev/zero of=/swapfile bs=1M count=16384 status=none || exit 0
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile >/dev/null
+          sudo swapon /swapfile || true
+          free -g
+
+      - name: 检出内核源码
+        run: |
+          set -euo pipefail
+          REF="${{ github.event.inputs.kernel_ref || 'master' }}"
+          git clone --depth 1 --branch "$REF" "$KERNEL_REPO" kernel || {
+            git clone "$KERNEL_REPO" kernel
+            git -C kernel checkout "$REF"
+          }
+          git -C kernel log --oneline -1
+          # 清掉 setlocalversion 的 '+'（与设备 vermagic 逐字符一致的前提）
+          : > kernel/.scmversion
+
+      - name: 检出 BakaSU
+        run: |
+          set -euo pipefail
+          REF="${{ github.event.inputs.bakasu_ref || '548d1dda060ca198823d8808804d01f5209ef4a9' }}"
+          git clone --filter=blob:none "$BAKASU_REPO" bakasu
+          git -C bakasu checkout "$REF"
+          git -C bakasu log --oneline -1
+
+      - name: 集成 BakaSU（拷贝源码 + 手动钩子）
+        run: |
+          set -euo pipefail
+          python3 scripts/integrate.py kernel bakasu/kernel sprd_ums9157_defconfig 2>&1 | tee integrate.log
+          echo "=== 校验钩子 ==="
+          for pat in 'ksu_handle_stat' 'ksu_handle_execveat' 'ksu_handle_faccessat' \
+                     'ksu_handle_sys_reboot' 'ksu_handle_input_handle_event'; do
+            n=$(grep -rl "$pat" kernel/fs kernel/kernel kernel/drivers/input 2>/dev/null | wc -l)
+            echo "$pat -> $n"
+            [ "$n" -ge 1 ] || { echo "::error::hook missing: $pat"; exit 1; }
+          done
+          grep -q 'source "drivers/kernelsu/Kconfig"' kernel/drivers/Kconfig
+          grep -q 'obj-$(CONFIG_KSU) += kernelsu/' kernel/drivers/Makefile
+          grep -q '^CONFIG_KSU=y' kernel/arch/arm64/configs/sprd_ums9157_defconfig
+
+      - name: defconfig
+        run: |
+          set -euo pipefail
+          cd kernel
+          make LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_COMPAT=arm-linux-gnueabi- sprd_ums9157_defconfig 2>&1 | tee defconfig.log
+          test -f .config
+          for c in CONFIG_CC_IS_CLANG CONFIG_LTO_CLANG CONFIG_CFI_CLANG CONFIG_SHADOW_CALL_STACK CONFIG_MODVERSIONS CONFIG_KSU CONFIG_KSU_MANUAL_HOOK CONFIG_KALLSYMS_ALL; do
+            grep -q "^$c=y" .config || { echo "::error::$c 没有生效"; grep -E "^($c|# $c)" .config || true; exit 1; }
+          done
+          grep -q '^# CONFIG_KSU_TRACEPOINT_HOOK is not set' .config || { echo "::error::必须关闭 TRACEPOINT_HOOK（5.4 不是 GKI2）"; exit 1; }
+          grep -q "^CONFIG_CLANG_VERSION=120005" .config || { echo "::error::clang 版本不是 12.0.5"; exit 1; }
+          echo "=== KSU 相关 ==="
+          grep -E "^CONFIG_KSU" .config
+
+      - name: 编译 Image
+        run: |
+          set -euo pipefail
+          cd kernel
+          timeout 12000 make -k -j2 LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_COMPAT=arm-linux-gnueabi- Image 2>&1 | tee build.log || true
+          test -f arch/arm64/boot/Image || { echo "::error::Image 没有产出"; exit 1; }
+
+      - name: 编译 modules
+        run: |
+          set -euo pipefail
+          cd kernel
+          timeout 12000 make -k -j2 LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_COMPAT=arm-linux-gnueabi- modules 2>&1 | tee modules.log || true
+
+      - name: 错误清单
+        if: always()
+        run: |
+          for f in kernel/build.log kernel/modules.log kernel/defconfig.log; do
+            [ -f "$f" ] || continue
+            echo "########## $f ##########"
+            grep -hoE '[^ :]+\.(c|h|S):[0-9]+:[0-9]+: (error|fatal error):.*' "$f" | sort -u | head -100 || true
+          done
+          grep -hoE '[^ :]+\.(c|h|S):[0-9]+:[0-9]+: (error|fatal error):.*' kernel/build.log 2>/dev/null \
+            | sort -u | head -25 | while IFS= read -r line; do echo "::error::$line"; done
+          grep -E 'undefined reference to' kernel/build.log 2>/dev/null \
+            | sed 's/^ *//' | sort -u | head -25 | while IFS= read -r line; do echo "::error::$line"; done
+
+      - name: 校验 KSU 符号进内核
+        if: always()
+        run: |
+          if [ -f kernel/System.map ]; then
+            echo "=== ksu 符号数 ==="
+            grep -c ' ksu_' kernel/System.map || true
+            grep -E ' T (ksu_handle_stat|ksu_handle_execveat|ksu_handle_faccessat|ksu_handle_sys_reboot)$' kernel/System.map || true
+          fi
+
+      - name: 校验 vermagic
+        if: always()
+        run: |
+          cd kernel
+          KO=$(find . -name 'dwc3-sprd-core.ko' | head -1)
+          if [ -n "$KO" ]; then
+            VM=$(strings -a "$KO" | grep -m1 '^vermagic=')
+            echo "got: $VM"
+            case "$VM" in
+              "vermagic=5.4.210-android12-9-g96901d45d5a5-ab50 SMP preempt mod_unload modversions aarch64")
+                echo "OK" ;;
+              *) echo "::error::vermagic 不一致: $VM"; exit 1 ;;
+            esac
+          else
+            echo "没有 dwc3-sprd-core.ko，跳过"
+          fi
+
+      - name: 打包 boot.img
+        if: always()
+        run: |
+          set -euo pipefail
+          if [ -f kernel/arch/arm64/boot/Image ]; then
+            python3 scripts/pack_boot.py --kernel kernel/arch/arm64/boot/Image --out boot.img
+            python3 scripts/pack_boot.py --verify boot.img
+            python3 -c "import struct; t=open('boot.img','rb').read()[-64:]; assert t[:4]==b'AVBf', 'AvbFooter missing'; o,v,s=struct.unpack('>QQQ', t[12:36]); print('AVB footer: image_end=%d vbmeta@%d size=%d' % (o,v,s))"
+          else
+            exit 1
+          fi
+
+      - name: 收集模块
+        if: always()
+        run: |
+          cd kernel
+          find . -path ./.git -prune -o -name '*.ko' -print0 | tar --null -czf ../modules.tgz -T - || true
+          ls -lh ../modules.tgz || true
+
+      - name: 上传产物
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bakasu-build
+          path: |
+            boot.img
+            kernel/arch/arm64/boot/Image
+            kernel/System.map
+            kernel/Module.symvers
+            kernel/.config
+            kernel/build.log
+            kernel/modules.log
+            kernel/defconfig.log
+            modules.tgz
+            integrate.log
+          include-hidden-files: true
+          retention-days: 14
+          if-no-files-found: warn
+
+      - name: 发布 release
+        if: success()
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0.${{ github.run_number }}
+          name: BakaSU-Kernel v1.0.${{ github.run_number }}
+          body: |
+            - 内核: `5.4.210-android12-9-g96901d45d5a5-ab50`（GKI 骨架 + 设备实现）
+            - BakaSU: `${{ github.event.inputs.bakasu_ref || '548d1dda06' }}`，手动钩子模式
+            - 刷入: `fastboot flash boot boot.img`（已内嵌 AVB0 + AvbFooter）
+            - 刷完用 BakaSU 管理器验证 root
+          files: |
+            boot.img
+            modules.tgz
+          draft: false
+          prerelease: false
