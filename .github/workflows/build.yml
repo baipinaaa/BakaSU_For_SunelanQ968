@@ -14,11 +14,6 @@ on:
         description: '内核仓库分支或提交'
         required: false
         default: 'master'
-  push:
-    branches: [main]
-    paths-ignore:
-      - 'README.md'
-      - 'docs/**'
 
 permissions:
   contents: write
